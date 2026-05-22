@@ -67,47 +67,42 @@ def parse_response_source(path):
     raise FileNotFoundError(f"Response log not found: {path}")
 
 
-def parse_response_log(path):
-    """Parse a server response or database status log to determine validation data."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Response log not found: {path}")
-
+def parse_response_text(text):
+    """Parse raw response text using regex extraction for status, payload and rows."""
     status_code = None
     error_detected = False
     payload_size = None
     db_rows = None
-    raw_lines = []
+    raw_lines = text.splitlines()
 
     status_re = re.compile(r"HTTP/\d(?:\.\d)?\s+(\d{3})")
     content_length_re = re.compile(r"Content-Length:\s*(\d+)", re.I)
-    bytes_re = re.compile(r"(?:bytes|payload|size)[:=]\s*(\d+)", re.I)
+    bytes_re = re.compile(r"(?:bytes|payload|size|bytes_sent|content_length)[:=]\s*(\d+)", re.I)
     db_rows_re = re.compile(r"(?:rows returned|rows affected|row_count)[:=]\s*(\d+)", re.I)
     error_re = re.compile(r"\b(ERROR|FAIL|EXCEPTION|500|502|503|504|404)\b", re.I)
 
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            raw_lines.append(line.rstrip("\n"))
-            if status_code is None:
-                status_match = status_re.search(line)
-                if status_match:
-                    status_code = int(status_match.group(1))
+    for line in raw_lines:
+        if status_code is None:
+            status_match = status_re.search(line)
+            if status_match:
+                status_code = int(status_match.group(1))
 
-            if payload_size is None:
-                content_length_match = content_length_re.search(line)
-                if content_length_match:
-                    payload_size = int(content_length_match.group(1))
-                else:
-                    bytes_match = bytes_re.search(line)
-                    if bytes_match:
-                        payload_size = int(bytes_match.group(1))
+        if payload_size is None:
+            content_length_match = content_length_re.search(line)
+            if content_length_match:
+                payload_size = int(content_length_match.group(1))
+            else:
+                bytes_match = bytes_re.search(line)
+                if bytes_match:
+                    payload_size = int(bytes_match.group(1))
 
-            if db_rows is None:
-                db_rows_match = db_rows_re.search(line)
-                if db_rows_match:
-                    db_rows = int(db_rows_match.group(1))
+        if db_rows is None:
+            db_rows_match = db_rows_re.search(line)
+            if db_rows_match:
+                db_rows = int(db_rows_match.group(1))
 
-            if error_re.search(line):
-                error_detected = True
+        if error_re.search(line):
+            error_detected = True
 
     return {
         "status_code": status_code,
@@ -116,6 +111,166 @@ def parse_response_log(path):
         "error_detected": error_detected,
         "raw_log": raw_lines,
     }
+
+
+def parse_json_response_entries(text):
+    """Parse JSON entries from a text log, supporting arrays and newline-delimited JSON."""
+    entries = []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        if "responses" in parsed and isinstance(parsed["responses"], list):
+            entries = parsed["responses"]
+        elif "logs" in parsed and isinstance(parsed["logs"], list):
+            entries = parsed["logs"]
+        else:
+            entries = [parsed]
+    elif isinstance(parsed, list):
+        entries = parsed
+    else:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line[0] not in "{[":
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    entries.append(obj)
+            except json.JSONDecodeError:
+                continue
+
+    return entries
+
+
+def normalize_response_entry(entry):
+    """Convert a response entry object into normalized validation fields."""
+    if not isinstance(entry, dict):
+        return None
+
+    status_code = entry.get("status_code") or entry.get("http_status") or entry.get("status") or entry.get("response_code")
+    if isinstance(status_code, str) and status_code.isdigit():
+        status_code = int(status_code)
+    elif isinstance(status_code, (int, float)):
+        status_code = int(status_code)
+    else:
+        status_code = None
+
+    payload_size = entry.get("payload_size") or entry.get("bytes_sent") or entry.get("size") or entry.get("content_length") or entry.get("length")
+    if isinstance(payload_size, str) and payload_size.isdigit():
+        payload_size = int(payload_size)
+    elif isinstance(payload_size, (int, float)):
+        payload_size = int(payload_size)
+    else:
+        payload_size = None
+
+    db_rows = entry.get("db_rows") or entry.get("rows") or entry.get("rows_affected") or entry.get("row_count") or entry.get("rows_returned")
+    if isinstance(db_rows, str) and db_rows.isdigit():
+        db_rows = int(db_rows)
+    elif isinstance(db_rows, (int, float)):
+        db_rows = int(db_rows)
+    else:
+        db_rows = None
+
+    error_detected = False
+    if status_code and status_code >= 400:
+        error_detected = True
+    notes = entry.get("notes") or entry.get("message") or entry.get("error") or ""
+    if isinstance(notes, str) and re.search(r"\b(ERROR|FAIL|EXCEPTION|BLOCKED|DENIED|500|502|503|504|404)\b", notes, re.I):
+        error_detected = True
+
+    return {
+        "status_code": status_code,
+        "payload_size": payload_size,
+        "db_rows": db_rows,
+        "error_detected": error_detected,
+        "raw_log": [json.dumps(entry, ensure_ascii=False)],
+    }
+
+
+def match_response_entry(alert, entry):
+    """Score how well a response entry matches the alert."""
+    if not isinstance(entry, dict):
+        return 0
+
+    score = 0
+    alert_ips = set(extract_alert_ips(alert))
+    entry_ips = set()
+    for key in ("ip", "source_ip", "src_ip", "client_ip", "destination_ip", "dest_ip"):
+        value = entry.get(key)
+        if isinstance(value, str):
+            entry_ips.add(value)
+        elif isinstance(value, list):
+            entry_ips.update(v for v in value if isinstance(v, str))
+
+    if alert_ips and entry_ips and alert_ips.intersection(entry_ips):
+        score += 10
+
+    alert_targets = extract_alert_targets(alert)
+    entry_text = json.dumps(entry) if isinstance(entry, dict) else str(entry)
+    for target in alert_targets:
+        if target and target in entry_text:
+            score += 5
+
+    return score
+
+
+def extract_alert_targets(alert):
+    """Extract likely target strings from an alert object."""
+    targets = set()
+    for key in ("target", "url", "request", "path", "resource"):
+        value = alert.get(key)
+        if isinstance(value, str):
+            targets.add(value)
+        elif isinstance(value, list):
+            targets.update(v for v in value if isinstance(v, str))
+
+    if "line" in alert and isinstance(alert["line"], str):
+        targets.update(re.findall(r"/(?:[A-Za-z0-9_\-./?=&%]+)", alert["line"]))
+
+    return [t for t in targets if isinstance(t, str)]
+
+
+def find_best_response_entry(alert, entries):
+    """Choose the best matching response entry for a given alert."""
+    best = None
+    best_score = 0
+    for entry in entries:
+        score = match_response_entry(alert, entry)
+        if score > best_score:
+            best_score = score
+            best = entry
+    return best
+
+
+def parse_response_log(path, alert=None):
+    """Parse a server response log and optionally correlate it to a specific alert."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Response log not found: {path}")
+
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+
+    entries = parse_json_response_entries(text)
+    if alert and entries:
+        matched_entry = find_best_response_entry(alert, entries)
+        if matched_entry is not None:
+            normalized = normalize_response_entry(matched_entry)
+            if normalized is not None:
+                return normalized
+
+    if alert:
+        alert_ips = extract_alert_ips(alert)
+        if alert_ips:
+            matching_lines = [line for line in text.splitlines() if any(ip in line for ip in alert_ips)]
+            if matching_lines:
+                return parse_response_text("\n".join(matching_lines))
+
+    return parse_response_text(text)
 
 
 def extract_alert_ips(alert):
@@ -175,7 +330,7 @@ def validate_alerts(alerts, response_paths):
     for index, alert in enumerate(alerts, start=1):
         response_path = find_best_response_path(alert, response_paths)
         if response_path:
-            response_data = parse_response_log(response_path)
+            response_data = parse_response_log(response_path, alert=alert)
         else:
             response_data = {
                 "status_code": None,
